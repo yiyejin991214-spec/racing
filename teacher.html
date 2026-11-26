@@ -1,0 +1,188 @@
+<!doctype html>
+<html lang="ko"><head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<link href="https://fonts.googleapis.com/css2?family=Fredoka:wght@500;700&family=Jua&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="style.css">
+<script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2.45.4/dist/umd/supabase.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/canvas-confetti@1.9.3/dist/confetti.browser.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/qrcode-generator@1.4.4/qrcode.js"></script>
+<title>선생님 - 퀴즈 로드 러시</title>
+<script src="config.js"></script><script src="common.js"></script>
+</head><body><main class="wrap">
+
+<section id="v-setup" class="view glass narrow">
+  <h1>🏎️ 퀴즈 로드 러시</h1><p>정답 차선으로 달리는 학습 레이스!</p>
+  <h3>문제 분야 (여러 개 선택)</h3><div id="cats" class="chips"></div>
+  <label>게임 시간</label>
+  <select id="dur"><option value="60">1분</option><option value="120" selected>2분</option><option value="180">3분</option></select>
+  <label>수학 수준</label>
+  <select id="lvl"><option value="1">저학년 (덧셈·뺄셈)</option><option value="2" selected>중학년 (곱셈구구)</option><option value="3">고학년 (두 자리 곱셈·나눗셈)</option></select>
+  <p><button id="create" class="btn btn-yellow">방 만들기</button></p><p id="err" class="err"></p>
+</section>
+
+<section id="v-lobby" class="view lobby" hidden>
+  <div class="glass center">
+    <h2>퀴즈 로드 러시</h2><p>휴대폰 카메라로 찍고 들어오세요</p>
+    <div id="qr"></div><p>방 번호</p><div id="code" class="code num"></div>
+    <small id="url" style="word-break:break-all"></small>
+  </div>
+  <div class="glass">
+    <span class="pill" id="lcats"></span>
+    <h3>출발선에 선 선수들 <span id="cnt" class="num">0</span>명</h3>
+    <div id="grid" class="grid"></div>
+    <div style="display:flex;justify-content:space-between">
+      <button id="delBtn2" class="btn btn-ghost">방 지우기</button>
+      <button id="start" class="btn btn-yellow" disabled>▶ 출발!</button>
+    </div>
+  </div>
+</section>
+
+<section id="v-play" class="view" hidden>
+  <div class="glass top">
+    <div><b style="font-size:22px">🏎️ 퀴즈 로드 러시</b><br><small id="pinfo"></small></div>
+    <div id="turboBanner" class="turbo" hidden></div>
+    <div class="btns">
+      <div class="timer"><svg width="46" viewBox="0 0 36 36"><circle cx="18" cy="18" r="16" fill="none" stroke="#dfe7f5" stroke-width="4"/><circle id="ring" cx="18" cy="18" r="16" fill="none" stroke="#3a58d6" stroke-width="4" stroke-linecap="round" stroke-dasharray="100.5" transform="rotate(-90 18 18)"/></svg><b id="tm" class="num">00:00</b></div>
+      <button id="turboBtn" class="btn btn-yellow">🔥 터보 타임</button>
+      <button id="endBtn" class="btn btn-pink">게임 종료</button>
+    </div>
+  </div>
+  <div class="play">
+    <div class="glass"><h2>실시간 레이스 🏁</h2><small>정답을 맞힐 때마다 앞으로 달려요 (상위 12명)</small><div id="race" class="race"></div></div>
+    <div>
+      <div class="glass stat">
+        <div><small>전체 정답률</small><b id="s1" class="num">0%</b></div>
+        <div><small>푼 문제 합계</small><b id="s2" class="num">0</b></div>
+      </div>
+      <div class="glass" style="margin-top:12px"><h3>📌 우리 반이 많이 틀린 문제</h3><div id="hard" class="hard"></div></div>
+      <div class="glass" style="margin-top:12px"><h3>방금 일어난 일</h3><div id="news" class="news"></div></div>
+    </div>
+  </div>
+</section>
+
+<section id="v-result" class="view center" hidden>
+  <h1>🏆 오늘의 레이스 결과</h1>
+  <div id="podium" class="podium"></div><div id="rest" style="margin-top:14px"></div>
+  <div class="glass" style="max-width:760px;margin:14px auto;text-align:left"><h3>📌 다시 짚어 볼 문제 (많이 틀린 순)</h3><div id="hard2" class="hard"></div></div>
+  <p><button id="delBtn" class="btn btn-ghost">학생 기록 지우기</button> <button id="newBtn" class="btn btn-yellow">새 게임 만들기</button></p>
+</section>
+</main><div id="sync" class="sync"></div>
+
+<script>
+let saved = JSON.parse(localStorage.getItem('qrr-room') || 'null'), room = null, players = [], sync = null, qrFor = '',
+    ending = false, prev = {}, news = [], leader = null, lastTurbo = null, celebrated = false, first = true;
+const sel = new Set(Object.keys(CATS));
+const call = (fn, x = {}) => rpc(fn, { p_room: saved.id, p_code: saved.code, ...x });
+
+/* Step 2: 방 만들기 */
+Object.entries(CATS).forEach(([k, v]) => {
+  const b = el('button', 'chip on', v);
+  b.onclick = () => { sel.has(k) ? sel.delete(k) : sel.add(k); b.classList.toggle('on'); $('#create').disabled = !sel.size; };
+  $('#cats').append(b);
+});
+$('#create').onclick = async () => {
+  try {
+    $('#err').textContent = '';
+    const r = await rpc('create_room', { p_cats: [...sel], p_duration: +$('#dur').value, p_level: +$('#lvl').value });
+    saved = { id: r.room_id, code: r.teacher_code }; localStorage.setItem('qrr-room', JSON.stringify(saved));
+    celebrated = false; first = true; await refresh();
+  } catch (e) { $('#err').textContent = e.message; }
+};
+function forget() {
+  localStorage.removeItem('qrr-room'); saved = null; room = null; prev = {}; news = []; ending = false; first = true;
+  if (sync) { sync.stop(); sync = null; } show('v-setup');
+}
+
+async function refresh() {
+  try {
+    if (!saved) { show('v-setup'); return; }
+    const [a, b] = await Promise.all([
+      db.from('rooms').select('*').eq('id', saved.id).maybeSingle(),
+      db.from('players').select('*').eq('room_id', saved.id)]);
+    if (!a.data) { forget(); return; }
+    room = a.data; players = rankSort(b.data || []);
+    if (!sync) { await syncClock(); sync = startSync([{ table: 'rooms', filter: 'id=eq.' + saved.id }, { table: 'players', filter: 'room_id=eq.' + saved.id }], refreshT); }
+    if (room.status === 'waiting') lobby(); else if (room.status === 'playing') play(); else result();
+  } catch (e) { console.error(e); }
+}
+const refreshT = throttle(refresh, 400);
+
+function lobby() {
+  show('v-lobby'); $('#code').textContent = room.id;
+  const url = location.origin + location.pathname.replace(/[^/]*$/, '') + 'student.html?code=' + room.id;
+  if (qrFor !== url) { qrFor = url; const qr = qrcode(0, 'M'); qr.addData(url); qr.make(); $('#qr').innerHTML = qr.createSvgTag(5, 0); }
+  $('#url').textContent = url;
+  $('#lcats').textContent = room.cats.map(t => CATS[t]).join(' · ') + ' · ' + room.duration / 60 + '분';
+  $('#cnt').textContent = players.length;
+  $('#grid').replaceChildren(...players.map(p => { const d = el('div', 'pl'); d.append(carEl(p.animal), el('div', '', p.nickname)); return d; }));
+  $('#start').disabled = !players.length;
+}
+
+/* Step 3: 시작 · 종료 · 타이머(서버 시계) · 터보 */
+$('#start').onclick = () => call('start_game').then(refresh).catch(e => alert(e.message));
+$('#endBtn').onclick = () => confirm('게임을 끝낼까요?') && call('end_game').then(refresh);
+$('#turboBtn').onclick = () => call('set_turbo').then(refresh);
+const del = () => confirm('방과 학생 기록을 모두 지울까요?') && call('delete_room').then(forget);
+$('#delBtn').onclick = del; $('#delBtn2').onclick = del; $('#newBtn').onclick = forget;
+
+setInterval(() => {
+  if (!room || room.status !== 'playing') return;
+  const left = Date.parse(room.ends_at) - now();
+  $('#tm').textContent = mmss(left);
+  $('#ring').style.strokeDashoffset = 100.5 * (1 - Math.max(0, Math.min(1, left / (room.duration * 1000))));
+  const t = room.turbo_until ? Date.parse(room.turbo_until) - now() : 0;
+  $('#turboBanner').hidden = t <= 0; $('#turboBanner').textContent = '🔥 터보 타임! 거리 2배 · ' + Math.ceil(t / 1000) + '초';
+  $('#turboBtn').disabled = t > 0; $('#race').classList.toggle('turbo', t > 0);
+  if (left <= 0 && !ending) { ending = true; call('end_game').then(refresh).catch(() => ending = false); }
+}, 250);
+
+/* Step 5: 레이스 */
+function push(t, hot) { news.unshift({ t, hot }); news = news.slice(0, 5); }
+function play() {
+  show('v-play');
+  $('#pinfo').textContent = `방 번호 ${room.id} · ${players.length}명 참여 중`;
+  if (!first) {
+    players.forEach(p => { const o = prev[p.id]; if (o && p.streak > o.st && p.streak % 3 === 0) push(`🔥 ${p.nickname} ${p.streak}연속 정답! 콤보 질주!`, 1); });
+    if (players[0] && players[0].dist > 0 && leader && players[0].id !== leader) push(`👑 ${players[0].nickname}이(가) 1등으로 올라섰어요`);
+    if (room.turbo_until && room.turbo_until !== lastTurbo) push('🔥 터보 타임 시작! 20초 동안 거리 2배', 1);
+  }
+  first = false; lastTurbo = room.turbo_until; if (players[0] && players[0].dist > 0) leader = players[0].id;
+  prev = Object.fromEntries(players.map(p => [p.id, { st: p.streak }]));
+  race(); stats(); $('#news').replaceChildren(...news.map(n => el('div', n.hot ? 'hot' : '', n.t)));
+}
+function race() {
+  const box = $('#race'), top = players.slice(0, 12), max = Math.max(500, (top[0] ? top[0].dist : 0) * 1.05);
+  box.style.height = top.length * 52 + 'px';
+  const ids = new Set(top.map(p => p.id));
+  $$('.lane', box).forEach(l => { if (!ids.has(l.dataset.id)) l.remove(); });
+  top.forEach((p, i) => {
+    let l = $(`.lane[data-id="${p.id}"]`, box);
+    if (!l) {
+      l = el('div', 'lane'); l.dataset.id = p.id;
+      const road = el('div', 'road'); road.append(carEl(p.animal), el('i', 'sc num'));
+      l.append(el('b', 'rk num'), el('span', 'nm'), road); box.append(l);
+    }
+    l.style.transform = `translateY(${i * 52}px)`;
+    $('.rk', l).textContent = i + 1; $('.nm', l).textContent = p.nickname;
+    $('.carx', l).style.left = `calc((100% - 60px) * ${Math.min(1, p.dist / max)})`; $('.sc', l).textContent = p.dist + 'm';
+  });
+}
+function stats() {
+  const sc = players.reduce((a, p) => a + p.correct, 0), ss = players.reduce((a, p) => a + p.solved, 0);
+  $('#s1').textContent = (ss ? Math.round(sc / ss * 100) : 0) + '%'; $('#s2').textContent = ss;
+}
+const hardRender = (box, list) => box.replaceChildren(...(list.length ? list.map(h => { const d = el('div', '', `${h.q}  → 정답: ${h.a}  (${h.w}명 오답)`); return d; }) : [el('div', '', '아직 없어요')]));
+async function loadHard(box) { try { hardRender(box, await call('get_hard')); } catch (e) { } }
+setInterval(() => { if (saved && room && room.status === 'playing') loadHard($('#hard')); }, 5000);
+
+/* Step 6: 결과 */
+function result() {
+  show('v-result');
+  const card = (p, n, cls) => { const d = el('div', 'glass pd ' + cls); d.append(el('div', 'big num', n), carEl(p.animal), el('div', '', p.nickname), el('b', 'num', p.dist + 'm'), el('div', '', `정답 ${p.correct} · 정확도 ${acc(p)}%`)); return d; };
+  $('#podium').replaceChildren(...[0, 1, 2].filter(i => players[i]).map(i => card(players[i], i + 1, 'pd' + (i + 1))));
+  $('#rest').replaceChildren(...players.slice(3).map((p, i) => { const r = el('div', 'rowp'); r.append(el('span', '', `${i + 4}. ${p.nickname}`), el('span', 'num', `${p.dist}m (정답 ${p.correct} · 정확도 ${acc(p)}%)`)); return r; }));
+  loadHard($('#hard2'));
+  if (!celebrated) { celebrated = true; confetti({ particleCount: 160, spread: 90, origin: { y: .4 } }); }
+}
+refresh();
+</script></body></html>

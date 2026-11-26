@@ -1,0 +1,216 @@
+<!doctype html>
+<html lang="ko"><head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<link href="https://fonts.googleapis.com/css2?family=Fredoka:wght@500;700&family=Jua&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="style.css">
+<script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2.45.4/dist/umd/supabase.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/canvas-confetti@1.9.3/dist/confetti.browser.min.js"></script>
+<title>퀴즈 로드 러시</title>
+<script src="config.js"></script><script src="common.js"></script>
+</head><body><main class="wrap narrow">
+
+<section id="v-join" class="view glass">
+  <h1 class="center">🏎️ 퀴즈 로드 러시</h1>
+  <label>방 번호</label><input id="room" class="num" inputmode="numeric" maxlength="4" placeholder="4자리">
+  <label>내 이름 (별명도 좋아요, 1~10자)</label><input id="nick" maxlength="10">
+  <label>내 자동차 색</label><div id="cars" class="cars"></div>
+  <button id="go" class="btn btn-yellow" style="width:100%">출발선으로!</button><p id="err" class="err"></p>
+</section>
+
+<section id="v-wait" class="view glass center" hidden>
+  <div id="wcar" style="margin:30px 0;transform:scale(2)"></div><h2 id="wn"></h2>
+  <p id="wmsg" class="glass">선생님이 출발하면 바로 달려요!</p>
+  <p><a href="#" id="again">다른 이름으로 다시 들어가기</a></p>
+</section>
+
+<section id="v-play" class="view" hidden>
+  <div class="glass hud"><b id="pn"></b><span><span id="dist" class="tag num">🏁 0m</span> <span id="st" class="tag num">🔥 0</span> <b id="tm" class="num">00:00</b></span></div>
+  <div class="qbar"><span id="cat" class="pill"></span> <span id="rev" class="pill rev" hidden>🔁 복습 문제!</span><div id="q" class="q"></div><div id="fb" class="fb"></div></div>
+  <div class="cv-wrap"><canvas id="cv"></canvas><div id="turbo" class="turbo" hidden>🔥 터보 타임! 거리 2배</div></div>
+  <div class="hint">정답이 있는 차선을 누르세요 · 같은 차선을 한 번 더 누르면 바로 통과!</div>
+</section>
+
+<section id="v-end" class="view glass center" hidden>
+  <h2>🏁 결승선!</h2><div id="ec"></div><div id="en"></div>
+  <div id="erank" class="num" style="font-size:64px;color:#3a58d6"></div><div id="es"></div>
+  <h3 style="margin-top:14px">📒 복습 노트 <small>(아직 못 맞힌 문제)</small></h3><div id="review"></div>
+</section>
+</main><div id="sync" class="sync"></div>
+
+<script>
+let me = JSON.parse(sessionStorage.getItem('qrr-player') || 'null'), room = null, sync = null, loading = false, sel = COLORS[0], celeb = false;
+const code = new URLSearchParams(location.search).get('code');
+if (code) $('#room').value = code.replace(/\D/g, '').slice(0, 4);
+
+/* Step 2: 입장 */
+COLORS.forEach(c => {
+  const b = el('button', 'cbtn' + (c === sel ? ' on' : ''), ''); b.type = 'button'; b.style.background = c;
+  b.onclick = () => { sel = c; $$('.cbtn').forEach(x => x.classList.toggle('on', x === b)); };
+  $('#cars').append(b);
+});
+$('#go').onclick = async () => {
+  try {
+    $('#err').textContent = '';
+    const rm = $('#room').value.trim(), nick = $('#nick').value.trim();
+    const r = await rpc('join_room', { p_room: rm, p_nick: nick, p_animal: sel });
+    me = { player_id: r.player_id, token: r.token, room: rm, nick, color: sel };
+    sessionStorage.setItem('qrr-player', JSON.stringify(me)); begin();
+  } catch (e) { $('#err').textContent = e.message; }
+};
+$('#again').onclick = e => { e.preventDefault(); leave(); };
+function leave() { if (sync) sync.stop(); sync = null; sessionStorage.removeItem('qrr-player'); me = null; G.q = null; G.state = 'idle'; show('v-join'); }
+async function begin() {
+  $('#wcar').replaceChildren(carEl(me.color)); $('#wn').textContent = me.nick; $('#pn').textContent = me.nick;
+  await syncClock(); if (sync) sync.stop();
+  sync = startSync([{ table: 'rooms', filter: 'id=eq.' + me.room }], refresh); refresh();
+}
+
+/* Step 3: 방 상태에 따라 화면 선택 */
+async function refresh() {
+  if (!me || loading) return;
+  const { data: rm } = await db.from('rooms').select('*').eq('id', me.room).maybeSingle();
+  if (!rm) { leave(); return; }
+  room = rm;
+  if (rm.status === 'waiting') { show('v-wait'); $('#wmsg').textContent = '선생님이 출발하면 바로 달려요!'; }
+  else if (rm.status === 'playing') { if (!G.q && G.state !== 'submit' && G.state !== 'result') await loadQ(); }
+  else await endView();
+}
+setInterval(() => {
+  if (!room || room.status !== 'playing' || !room.ends_at) return;
+  $('#tm').textContent = mmss(Date.parse(room.ends_at) - now());
+  $('#turbo').hidden = !(room.turbo_until && Date.parse(room.turbo_until) - now() > 0);
+}, 250);
+
+/* Step 4: 문제 받기 · 채점은 DB */
+async function loadQ() {
+  loading = true;
+  try {
+    const r = await rpc('next_question', { p_player: me.player_id, p_token: me.token });
+    if (r.status === 'playing') { show('v-play'); startGate(r); }
+    else if (r.status === 'closing') { show('v-wait'); $('#wmsg').textContent = '시간 끝! 결과를 기다리는 중이에요 🏁'; }
+  } catch (e) { console.error(e); }
+  loading = false;
+  if (room && room.status === 'ended') endView();
+}
+function startGate(q) {
+  G.q = q; G.lane = 1; G.picked = false; G.fast = false; G.gateT = 0; G.res = null; G.state = 'drive';
+  $('#cat').textContent = CATS[q.cat] || ''; $('#rev').hidden = !q.review; $('#q').textContent = q.q;
+  $('#fb').textContent = '게이트가 다가와요! 정답 차선으로 🚗'; $('#fb').className = 'fb';
+  fit();
+}
+
+/* Step 5: 운전 화면 (캔버스) */
+const cv = $('#cv'), ctx = cv.getContext('2d'), T = 6;     // 게이트가 내려오는 시간 6초 = 읽고 생각할 시간
+let W = 0, H = 0;
+const G = { state: 'idle', q: null, lane: 1, picked: false, fast: false, gateT: 0, carX: 0, scroll: 0, boost: 0, shake: 0, flash: null, res: null, pops: [],
+            items: Array.from({ length: 9 }, (_, i) => ({ y: i * 70, e: ['🌲', '🏠', '⛰️', '🌳', '🌷'][i % 5] })) };
+function fit() {
+  const r = cv.getBoundingClientRect(); if (!r.width) return;
+  const d = window.devicePixelRatio || 1; W = r.width; H = r.height; cv.width = W * d; cv.height = H * d; ctx.setTransform(d, 0, 0, d, 0, 0);
+}
+addEventListener('resize', fit);
+const RX = () => W * 0.06, RW = () => W * 0.88, laneX = i => RX() + RW() / 3 * (i + .5), carY = () => H - 90;
+function steer(ln) { if (G.state !== 'drive') return; if (G.picked && ln === G.lane) G.fast = true; else { G.lane = ln; G.picked = true; G.fast = false; } }
+cv.addEventListener('pointerdown', e => {
+  const r = cv.getBoundingClientRect();
+  steer(Math.max(0, Math.min(2, Math.floor((e.clientX - r.left - RX()) / (RW() / 3)))));
+});
+addEventListener('keydown', e => {
+  if (e.key === 'ArrowLeft') steer(Math.max(0, G.lane - 1)); else if (e.key === 'ArrowRight') steer(Math.min(2, G.lane + 1)); else if (e.key === 'Enter') steer(G.lane);
+});
+
+async function commit() {
+  if (G.state !== 'drive') return; G.state = 'submit';
+  let r;
+  try { r = await rpc('submit_answer', { p_player: me.player_id, p_token: me.token, p_choice: G.q.choices[G.lane] }); }
+  catch (e) { G.state = 'drive'; G.gateT = .8; return; }
+  if (r.result === 'closed') { G.state = 'idle'; G.q = null; refresh(); return; }
+  if (r.result === 'locked') { G.state = 'drive'; G.gateT = .8; return; }
+  G.res = r; G.okLane = G.q.choices.indexOf(r.correct_answer); G.state = 'result';
+  $('#dist').textContent = '🏁 ' + r.dist + 'm'; $('#st').textContent = '🔥 ' + r.streak;
+  const fb = $('#fb');
+  if (r.result === 'correct') {
+    G.boost = 1; G.flash = { c: '80,220,140', t: .5 }; G.pops.push({ t: '+' + r.gain + 'm', x: laneX(G.lane), y: carY() - 60, a: 1 });
+    fb.className = 'fb ok'; fb.textContent = (r.review ? '🔁 복습 성공! ' : '✅ 정답! ') + (r.combo ? '🔥 콤보 질주! ' : '') + `+${r.gain}m`;
+    if (r.combo) confetti({ particleCount: 70, spread: 70, origin: { y: .7 } });
+  } else {
+    G.shake = .5; G.flash = { c: '255,80,90', t: .6 };
+    fb.className = 'fb no'; fb.textContent = `❌ 정답은 "${r.correct_answer}" · ${r.exp || ''}`;
+  }
+  await sleep(r.result === 'correct' ? (r.combo ? 1000 : 750) : 2800);   // 틀리면 해설을 충분히 읽도록 오래 보여줌
+  if (room && room.status === 'ended') { G.q = null; G.state = 'idle'; endView(); return; }
+  if (r.next && r.next.q) startGate(r.next); else { G.q = null; G.state = 'idle'; refresh(); }
+}
+
+function update(dt) {
+  G.scroll += (G.boost > 0 ? 560 : 180) * dt;
+  G.items.forEach(it => { it.y += (G.boost > 0 ? 560 : 180) * dt; if (it.y > H + 30) it.y -= 9 * 70; });
+  G.carX += (laneX(G.lane) - G.carX) * Math.min(1, dt * 10);
+  if (G.boost > 0) G.boost -= dt; if (G.shake > 0) G.shake -= dt; if (G.flash) { G.flash.t -= dt; if (G.flash.t <= 0) G.flash = null; }
+  G.pops.forEach(p => { p.y -= 60 * dt; p.a -= dt * .9; }); G.pops = G.pops.filter(p => p.a > 0);
+  if (G.state === 'drive') { G.gateT += dt * (G.fast ? 5 : 1) / T; if (G.gateT >= 1) { G.gateT = 1; commit(); } }
+}
+function rr(x, y, w, h, r) { ctx.beginPath(); ctx.moveTo(x + r, y); ctx.arcTo(x + w, y, x + w, y + h, r); ctx.arcTo(x + w, y + h, x, y + h, r); ctx.arcTo(x, y + h, x, y, r); ctx.arcTo(x, y, x + w, y, r); ctx.closePath(); }
+function drawCar(x, y, color, boost) {
+  ctx.save(); ctx.translate(x, y);
+  if (boost) { ctx.fillStyle = '#ffb52e'; ctx.beginPath(); ctx.moveTo(-10, 32); ctx.lineTo(0, 70 + Math.random() * 20); ctx.lineTo(10, 32); ctx.fill(); }
+  ctx.fillStyle = '#222'; [[-24, -24], [14, -24], [-24, 10], [14, 10]].forEach(([a, b]) => { rr(a, b, 10, 18, 3); ctx.fill(); });
+  ctx.fillStyle = color; rr(-19, -34, 38, 68, 12); ctx.fill();
+  ctx.fillStyle = 'rgba(0,0,0,.18)'; rr(-19, 14, 38, 20, 10); ctx.fill();
+  ctx.fillStyle = '#bfe6ff'; rr(-12, -16, 24, 18, 5); ctx.fill();
+  ctx.fillStyle = '#fff'; ctx.fillRect(-14, -34, 6, 4); ctx.fillRect(8, -34, 6, 4);
+  ctx.restore();
+}
+function fitFont(t, maxW, size) { ctx.font = `${size}px Jua, sans-serif`; while (ctx.measureText(t).width > maxW && size > 12) { size -= 2; ctx.font = `${size}px Jua, sans-serif`; } }
+function draw() {
+  ctx.clearRect(0, 0, W, H);
+  ctx.fillStyle = '#55b86b'; ctx.fillRect(0, 0, W, H);                                   // 잔디
+  ctx.font = '28px serif'; ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+  G.items.forEach((it, i) => ctx.fillText(it.e, i % 2 ? W - RX() / 2 : RX() / 2, it.y));       // 길가 풍경
+  ctx.fillStyle = '#4a4f6e'; ctx.fillRect(RX(), 0, RW(), H);                               // 도로
+  ctx.fillStyle = '#fff'; ctx.fillRect(RX() - 4, 0, 4, H); ctx.fillRect(RX() + RW(), 0, 4, H);
+  ctx.strokeStyle = 'rgba(255,255,255,.7)'; ctx.lineWidth = 4; ctx.setLineDash([26, 22]); ctx.lineDashOffset = -G.scroll;
+  [1, 2].forEach(i => { ctx.beginPath(); ctx.moveTo(RX() + RW() / 3 * i, 0); ctx.lineTo(RX() + RW() / 3 * i, H); ctx.stroke(); }); ctx.setLineDash([]);
+  if (G.state === 'drive') { ctx.fillStyle = 'rgba(255,255,255,.14)'; ctx.fillRect(RX() + RW() / 3 * G.lane, 0, RW() / 3, H); }   // 내가 고른 차선
+  if (G.q) {                                                                               // 문제 게이트
+    const gy = -90 + G.gateT * (carY() - 40 + 90), lw = RW() / 3, bases = ['#d9ccff', '#ffc9d3', '#b9ecd9'];
+    G.q.choices.forEach((c, i) => {
+      let col = bases[i];
+      if (G.state === 'result') { if (i === G.okLane) col = '#2e9e6b'; else if (i === G.lane && G.res.result === 'wrong') col = '#d0343f'; }
+      ctx.fillStyle = col; rr(RX() + lw * i + 6, gy, lw - 12, 70, 14); ctx.fill();
+      ctx.strokeStyle = '#fff'; ctx.lineWidth = 3; ctx.stroke();
+      ctx.fillStyle = (G.state === 'result' && (i === G.okLane || (i === G.lane && G.res.result === 'wrong'))) ? '#fff' : '#1f2a55';
+      fitFont(c, lw - 24, 26); ctx.fillText(c, RX() + lw * i + lw / 2, gy + 36);
+    });
+  }
+  if (G.boost > 0) { ctx.strokeStyle = 'rgba(255,255,255,.6)'; ctx.lineWidth = 3; for (let i = 0; i < 8; i++) { const x = RX() + Math.random() * RW(), y = Math.random() * H; ctx.beginPath(); ctx.moveTo(x, y); ctx.lineTo(x, y + 40); ctx.stroke(); } }
+  const sh = G.shake > 0 ? (Math.random() - .5) * 14 : 0;
+  drawCar(G.carX + sh, carY(), me ? me.color : '#e8506c', G.boost > 0);
+  if (G.state === 'result' && G.res && G.res.result === 'wrong') { ctx.font = '44px serif'; ctx.fillText('💥', G.carX, carY() - 50); }
+  G.pops.forEach(p => { ctx.globalAlpha = Math.max(0, p.a); ctx.font = '30px Fredoka, sans-serif'; ctx.fillStyle = '#fff6a0'; ctx.strokeStyle = '#1f2a55'; ctx.lineWidth = 4; ctx.strokeText(p.t, p.x, p.y); ctx.fillText(p.t, p.x, p.y); ctx.globalAlpha = 1; });
+  if (G.flash) { ctx.fillStyle = `rgba(${G.flash.c},${Math.max(0, G.flash.t) * .5})`; ctx.fillRect(0, 0, W, H); }
+}
+let last = 0;
+function loop(ts) {
+  requestAnimationFrame(loop); const dt = Math.min(.05, (ts - last) / 1000 || 0); last = ts;
+  if ($('#v-play').hidden) return; if (!W) fit(); update(dt); draw();
+}
+requestAnimationFrame(loop);
+
+/* Step 6: 결승선 · 복습 노트 */
+async function endView() {
+  if (loading) return; loading = true;
+  try {
+    const { data } = await db.from('players').select('*').eq('room_id', me.room);
+    const pl = rankSort(data || []), i = pl.findIndex(p => p.id === me.player_id), p = pl[i];
+    if (!p) { leave(); return; }
+    show('v-end'); $('#ec').replaceChildren(carEl(p.animal)); $('#ec').style.cssText = 'margin:14px;transform:scale(1.6)'; $('#en').textContent = p.nickname;
+    $('#erank').textContent = (i + 1) + '등'; $('#es').textContent = `${p.dist}m · 맞힌 문제 ${p.correct}개 · 정확도 ${acc(p)}% (${pl.length}명 중)`;
+    const rv = await rpc('get_review', { p_player: me.player_id, p_token: me.token });
+    $('#review').replaceChildren(...(rv.length ? rv.map(x => { const d = el('div', 'rev-item'); d.append(el('div', '', x.q), el('b', '', '정답: ' + x.a), el('div', '', x.exp)); return d; }) : [el('div', 'rev-item', '🎉 복습할 문제가 없어요! 모두 맞혔어요')]));
+    if (!celeb && i < 3) { celeb = true; confetti({ particleCount: 140, spread: 90, origin: { y: .5 } }); }
+  } catch (e) { console.error(e); }
+  loading = false;
+}
+if (me) begin(); else show('v-join');
+</script></body></html>
